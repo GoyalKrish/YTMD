@@ -1,13 +1,21 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { DiscoveryHeader } from '../../components/DiscoveryHeader';
 import { PlayerContextCard } from '../../components/PlayerContextCard';
 import { DiscoveryControls } from '../../components/DiscoveryControls';
+import { SampleDebugCard } from '../../components/SampleDebugCard';
 import { TrackTimeline } from '../../components/TrackTimeline';
 import { EmptyState } from '../../components/EmptyState';
-import { VideoPlaybackState, DiscoveryStatus, TrackOccurrence, DiscoverySession } from '../../lib/types';
+import {
+  VideoPlaybackState,
+  DiscoveryStatus,
+  TrackOccurrence,
+  DiscoverySession,
+  CapturedSampleMeta
+} from '../../lib/types';
 import { ExtensionMessage } from '../../lib/messages';
 import { getSession, saveSession } from '../../lib/storage';
-import { Sparkles, Trash2 } from 'lucide-react';
+import { TabAudioCaptureSession } from '../../lib/audio-capture';
+import { Trash2 } from 'lucide-react';
 
 export default function App() {
   const [playbackState, setPlaybackState] = useState<VideoPlaybackState | null>(null);
@@ -15,6 +23,13 @@ export default function App() {
   const [occurrences, setOccurrences] = useState<TrackOccurrence[]>([]);
   const [status, setStatus] = useState<DiscoveryStatus>('idle');
   const [statusMessage, setStatusMessage] = useState<string>('');
+  
+  // Milestone 2 audio capture state
+  const [elapsedCaptureSec, setElapsedCaptureSec] = useState<number>(0);
+  const [lastCapturedSample, setLastCapturedSample] = useState<CapturedSampleMeta | null>(null);
+  const captureStartPlaybackSec = useRef<number>(0);
+  const isCapturingRef = useRef<boolean>(false);
+  const captureSessionRef = useRef<TabAudioCaptureSession | null>(null);
 
   // 1. Query the active tab to find YouTube player
   const queryActiveTab = useCallback(async () => {
@@ -24,13 +39,12 @@ export default function App() {
       setActiveTabId(tab.id);
 
       if (tab.url && tab.url.includes('youtube.com/watch')) {
-        // Request immediate state from content script
         chrome.tabs.sendMessage(
           tab.id,
           { type: 'REQUEST_PLAYER_STATE' } as ExtensionMessage,
           (response: VideoPlaybackState) => {
             if (chrome.runtime.lastError) {
-              console.log('[Sidepanel] Content script not yet ready on tab:', tab.id);
+              // Content script not ready yet
             } else if (response) {
               setPlaybackState(response);
             }
@@ -49,6 +63,7 @@ export default function App() {
     const videoId = playbackState?.videoId;
     if (!videoId) {
       setOccurrences([]);
+      setLastCapturedSample(null);
       return;
     }
 
@@ -80,28 +95,91 @@ export default function App() {
     saveSession(session).catch((err) => console.error('[Sidepanel] Failed to save session:', err));
   }, [occurrences, playbackState?.videoId, status]);
 
-  // 4. Setup runtime message listener and tab update listeners
+  // 4. Runtime message listener for capture events and player sync
   useEffect(() => {
     queryActiveTab();
 
     const handleMessage = (message: ExtensionMessage) => {
+      if ((message as any).type === 'TRIGGER_CAPTURE_SHORTCUT') {
+        if (!isCapturingRef.current) {
+          handleStartCapture();
+        }
+        return;
+      }
+
       if (message.type === 'YOUTUBE_PLAYER_STATE') {
-        setPlaybackState(message.payload);
+        const newState = message.payload;
+        setPlaybackState(newState);
+
+        // Milestone 2 check: if user seeks or pauses while capturing, warn and cancel
+        if (isCapturingRef.current) {
+          const expectedTime = captureStartPlaybackSec.current + elapsedCaptureSec;
+          if (newState.isPaused) {
+            handleCancelCapture('Video paused during capture');
+          } else if (Math.abs(newState.currentTime - expectedTime) > 4) {
+            handleCancelCapture('Playback was seeked; sample invalidated');
+          }
+        }
       } else if (message.type === 'YOUTUBE_NAVIGATED') {
+        if (isCapturingRef.current) {
+          handleCancelCapture('Video changed; capture aborted');
+        }
         queryActiveTab();
+      } else if (message.type === 'CAPTURE_PROGRESS') {
+        setElapsedCaptureSec(message.payload.elapsedSeconds);
+      } else if (message.type === 'CAPTURE_COMPLETE') {
+        const meta = message.payload.metadata;
+        setLastCapturedSample(meta);
+        setStatus('idle');
+        isCapturingRef.current = false;
+        setElapsedCaptureSec(0);
+        setStatusMessage('Captured 15s audio sample successfully!');
+
+        // Add occurrence to timeline
+        const startSec = Math.floor(meta.startPlaybackSeconds);
+        const endSec = Math.floor(meta.endPlaybackSeconds);
+        const newTrack: TrackOccurrence = {
+          id: `sample_${Date.now()}`,
+          trackKey: `audio_${startSec}`,
+          metadata: {
+            recordingId: null,
+            acoustId: null,
+            title: `Captured Audio Sample (${startSec}s - ${endSec}s)`,
+            artists: ['Tab Audio Stream'],
+            source: 'acoustid-musicbrainz'
+          },
+          observedWindows: [
+            {
+              sampleStartSeconds: startSec,
+              sampleEndSeconds: endSec,
+              matchedAtEpochMs: meta.capturedAtEpochMs
+            }
+          ],
+          approximateStartSeconds: startSec,
+          approximateEndSeconds: endSec,
+          lastSeenSeconds: endSec,
+          boundaryQuality: 'observed-only'
+        };
+
+        setOccurrences((prev) => {
+          const filtered = prev.filter((o) => Math.abs(o.approximateStartSeconds - startSec) > 3);
+          return [...filtered, newTrack].sort((a, b) => a.approximateStartSeconds - b.approximateStartSeconds);
+        });
+
+        setTimeout(() => setStatusMessage(''), 4000);
+      } else if (message.type === 'CAPTURE_ERROR') {
+        setStatus('error');
+        isCapturingRef.current = false;
+        setElapsedCaptureSec(0);
+        setStatusMessage(`Capture failed: ${message.payload.error}`);
       }
     };
 
     chrome.runtime.onMessage.addListener(handleMessage);
 
-    const handleTabActivated = () => {
-      queryActiveTab();
-    };
-
-    const handleTabUpdated = (_tabId: number, changeInfo: chrome.tabs.TabChangeInfo) => {
-      if (changeInfo.status === 'complete' || changeInfo.url) {
-        queryActiveTab();
-      }
+    const handleTabActivated = () => queryActiveTab();
+    const handleTabUpdated = (_id: number, change: chrome.tabs.TabChangeInfo) => {
+      if (change.status === 'complete' || change.url) queryActiveTab();
     };
 
     chrome.tabs.onActivated.addListener(handleTabActivated);
@@ -112,81 +190,155 @@ export default function App() {
       chrome.tabs.onActivated.removeListener(handleTabActivated);
       chrome.tabs.onUpdated.removeListener(handleTabUpdated);
     };
-  }, [queryActiveTab]);
+  }, [queryActiveTab, elapsedCaptureSec]);
 
-  // 5. Seek video in YouTube player
-  const handleSeek = (seconds: number) => {
-    if (!activeTabId) return;
+  // 5. Seek video in YouTube player (with self-healing fallback)
+  const handleSeek = async (seconds: number) => {
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const targetTabId = tab?.id || activeTabId;
+      if (!targetTabId) return;
 
-    chrome.tabs.sendMessage(
-      activeTabId,
-      {
-        type: 'SEEK_TO_TIMESTAMP',
-        payload: { seconds }
-      } as ExtensionMessage,
-      (response) => {
-        if (chrome.runtime.lastError) {
-          console.error('[Sidepanel] Seek error:', chrome.runtime.lastError);
-        } else {
-          console.log('[Sidepanel] Seek response:', response);
+      chrome.tabs.sendMessage(
+        targetTabId,
+        {
+          type: 'SEEK_TO_TIMESTAMP',
+          payload: { seconds }
+        } as ExtensionMessage,
+        (response) => {
+          if (chrome.runtime.lastError || !response?.success) {
+            // Self-healing fallback: seek the video element directly using scripting API
+            chrome.scripting?.executeScript({
+              target: { tabId: targetTabId },
+              func: (targetSec: number) => {
+                const video =
+                  document.querySelector<HTMLVideoElement>('video.html5-main-video') ||
+                  document.querySelector<HTMLVideoElement>('video');
+                if (video) {
+                  video.currentTime = targetSec;
+                }
+              },
+              args: [seconds]
+            }).catch(() => {});
+          }
         }
-      }
-    );
+      );
+    } catch (err: any) {
+      console.warn('[Sidepanel] Seek error:', err?.message || err);
+    }
   };
 
-  // 6. Milestone test action: Identify or add bookmark occurrence at current time
-  const handleIdentify = () => {
-    if (!playbackState) return;
+  // 6. Milestone 2: User-initiated tab audio capture using TabAudioCaptureSession
+  const handleStartCapture = async () => {
+    if (!playbackState || !playbackState.videoId) return;
 
-    setStatus('capturing');
-    setStatusMessage('Sampling audio window...');
+    setStatus('requesting-permission');
+    setStatusMessage('Connecting audio stream...');
 
-    setTimeout(() => {
-      setStatus('identifying');
-      setStatusMessage('Analyzing audio fingerprint...');
+    try {
+      // Query the active tab dynamically at click-time
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      const targetTabId = tab?.id || activeTabId;
 
-      setTimeout(() => {
-        setStatus('idle');
-        setStatusMessage('Track detected!');
+      if (!targetTabId) {
+        setStatus('error');
+        setStatusMessage('No active YouTube tab found');
+        return;
+      }
 
-        // Milestone 1 proof: add a test track pinned to the current timestamp
-        const currentSec = Math.floor(playbackState.currentTime);
-        const newTrack: TrackOccurrence = {
-          id: `trk_${Date.now()}`,
-          trackKey: `key_${currentSec}`,
-          metadata: {
-            recordingId: null,
-            acoustId: null,
-            title: `Sample Track at ${currentSec}s`,
-            artists: ['Audio Stream'],
-            source: 'acoustid-musicbrainz'
+      const startPlaybackSec = Math.floor(playbackState.currentTime);
+      captureStartPlaybackSec.current = startPlaybackSec;
+
+      const session = new TabAudioCaptureSession(
+        targetTabId,
+        playbackState.videoId,
+        startPlaybackSec,
+        15,
+        {
+          onProgress: (elapsed, _max) => {
+            setElapsedCaptureSec(elapsed);
           },
-          observedWindows: [
-            {
-              sampleStartSeconds: currentSec,
-              sampleEndSeconds: currentSec + 15,
-              matchedAtEpochMs: Date.now()
-            }
-          ],
-          approximateStartSeconds: currentSec,
-          approximateEndSeconds: currentSec + 15,
-          lastSeenSeconds: currentSec + 15,
-          boundaryQuality: 'observed-only'
-        };
+          onComplete: (meta) => {
+            setLastCapturedSample(meta);
+            setStatus('idle');
+            isCapturingRef.current = false;
+            setElapsedCaptureSec(0);
+            setStatusMessage('Captured 15s audio sample successfully!');
 
-        setOccurrences((prev) => {
-          // Avoid duplicates around same timestamp
-          const filtered = prev.filter((o) => Math.abs(o.approximateStartSeconds - currentSec) > 3);
-          return [...filtered, newTrack].sort((a, b) => a.approximateStartSeconds - b.approximateStartSeconds);
-        });
+            // Add occurrence to timeline
+            const startSec = Math.floor(meta.startPlaybackSeconds);
+            const endSec = Math.floor(meta.endPlaybackSeconds);
+            const newTrack: TrackOccurrence = {
+              id: `sample_${Date.now()}`,
+              trackKey: `audio_${startSec}`,
+              metadata: {
+                recordingId: null,
+                acoustId: null,
+                title: `Captured Audio Sample (${startSec}s - ${endSec}s)`,
+                artists: ['Tab Audio Stream'],
+                source: 'acoustid-musicbrainz'
+              },
+              observedWindows: [
+                {
+                  sampleStartSeconds: startSec,
+                  sampleEndSeconds: endSec,
+                  matchedAtEpochMs: meta.capturedAtEpochMs
+                }
+              ],
+              approximateStartSeconds: startSec,
+              approximateEndSeconds: endSec,
+              lastSeenSeconds: endSec,
+              boundaryQuality: 'observed-only'
+            };
 
-        setTimeout(() => setStatusMessage(''), 3000);
-      }, 1000);
-    }, 1000);
+            setOccurrences((prev) => {
+              const filtered = prev.filter((o) => Math.abs(o.approximateStartSeconds - startSec) > 3);
+              return [...filtered, newTrack].sort((a, b) => a.approximateStartSeconds - b.approximateStartSeconds);
+            });
+
+            setTimeout(() => setStatusMessage(''), 4000);
+          },
+          onError: (err) => {
+            setStatus('error');
+            isCapturingRef.current = false;
+            setElapsedCaptureSec(0);
+            setStatusMessage(`Capture failed: ${err}`);
+          }
+        }
+      );
+
+      captureSessionRef.current = session;
+      setStatus('capturing');
+      isCapturingRef.current = true;
+      setElapsedCaptureSec(0);
+      setStatusMessage('');
+
+      await session.start();
+    } catch (err: any) {
+      setStatus('error');
+      isCapturingRef.current = false;
+      setElapsedCaptureSec(0);
+      setStatusMessage(err?.message || 'Failed to start capture');
+    }
+  };
+
+  const handleStopCapture = () => {
+    captureSessionRef.current?.stop();
+    setStatusMessage('Finalizing sample...');
+  };
+
+  const handleCancelCapture = (reason = 'Capture cancelled') => {
+    captureSessionRef.current?.cancel(reason);
+    setStatus('idle');
+    isCapturingRef.current = false;
+    setElapsedCaptureSec(0);
+    setStatusMessage(reason);
+    setTimeout(() => setStatusMessage(''), 3500);
   };
 
   const handleClearTimeline = () => {
     setOccurrences([]);
+    setLastCapturedSample(null);
   };
 
   const isConnected = Boolean(playbackState && playbackState.videoId);
@@ -207,9 +359,20 @@ export default function App() {
           <DiscoveryControls
             status={status}
             disabled={!isConnected}
-            onIdentify={handleIdentify}
+            onStartCapture={handleStartCapture}
+            onStopCapture={handleStopCapture}
+            onCancelCapture={() => handleCancelCapture('Capture cancelled by user')}
+            elapsedSeconds={elapsedCaptureSec}
+            maxSeconds={15}
             statusMessage={statusMessage}
           />
+
+          {lastCapturedSample && (
+            <SampleDebugCard
+              sample={lastCapturedSample}
+              onSeek={handleSeek}
+            />
+          )}
 
           {occurrences.length > 0 ? (
             <>

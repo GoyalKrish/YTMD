@@ -56,9 +56,18 @@ The production bundle is generated in `.output/chrome-mv3`.
   - Tracks playback time, duration, paused state, and SPA navigation
   - Interactive seek controls (`-10s`, `+10s`, and direct timestamp jumps)
   - Persistent session timeline in `chrome.storage.local`
-- [ ] **Milestone 2: User-Initiated Tab Audio Capture**
-  - Capture bounded sample through offscreen document
-- [ ] **Milestone 3: Chromaprint / WASM Fingerprinting**
+- [x] **Milestone 2: User-Initiated Tab Audio Capture**
+  - Explicit user-initiated tab capture with `chrome.tabCapture` & `chrome.offscreen`
+  - Audio routed to `AudioContext.destination` to prevent tab audio muting
+  - 15-second bounded window with live progress bar and Finish/Cancel controls
+  - Real-time invalidation if playback is paused or sought during recording
+  - Sample metadata card with video window, byte size, duration, and instant seek
+- [x] **Milestone 3: Chromaprint / WASM Fingerprinting**
+  - High-performance WebAssembly Chromaprint integration via `rusty-chromaprint-wasm`
+  - Manifest V3 `'wasm-unsafe-eval'` CSP configured
+  - Audio decoding & 16-bit PCM conversion (`Float32Array` -> `Int16Array`)
+  - Compressed AcoustID fingerprint generation directly in browser memory without server uploads
+  - Unit tests verifying PCM math and synthetic sine-wave fingerprint generation (8/8 passing)
 - [ ] **Milestone 4: AcoustID & MusicBrainz Recognition**
 - [ ] **Milestone 5: Deduped Timeline & Track Occurrences**
 - [ ] **Milestone 6: Live Discovery Mode**

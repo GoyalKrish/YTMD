@@ -4,9 +4,15 @@ import { ExtensionMessage } from '../lib/messages';
 export default defineContentScript({
   matches: ['*://*.youtube.com/*'],
   runAt: 'document_idle',
+  allFrames: false,
+  matchAboutBlank: false,
   main() {
     // Only execute in top-level YouTube window, ignoring sandboxed or about:blank iframes
-    if (window.self !== window.top) {
+    try {
+      if (window.self !== window.top || window.location.href.startsWith('about:')) {
+        return;
+      }
+    } catch {
       return;
     }
 

@@ -1,4 +1,4 @@
-import { VideoPlaybackState, DiscoverySession, TrackOccurrence } from './types';
+import { VideoPlaybackState, DiscoverySession, TrackOccurrence, CapturedSampleMeta } from './types';
 
 export type ExtensionMessage =
   // Content Script -> Background / Sidepanel
@@ -9,13 +9,26 @@ export type ExtensionMessage =
   | { type: 'SEEK_TO_TIMESTAMP'; payload: { seconds: number } }
   | { type: 'REQUEST_PLAYER_STATE' }
 
+  // Sidepanel -> Background
+  | { type: 'GET_TAB_STREAM_ID'; payload: { tabId: number } }
+  | { type: 'ENSURE_OFFSCREEN' }
+
   // Sidepanel / Background -> Offscreen
-  | { type: 'START_CAPTURE'; payload: { streamId: string; maxDurationSeconds: number } }
+  | {
+      type: 'START_CAPTURE';
+      payload: {
+        streamId: string;
+        maxDurationSeconds: number;
+        videoId: string;
+        startPlaybackSeconds: number;
+      };
+    }
   | { type: 'STOP_CAPTURE' }
+  | { type: 'CANCEL_CAPTURE'; payload?: { reason?: string } }
 
   // Offscreen -> Background / Sidepanel
-  | { type: 'CAPTURE_PROGRESS'; payload: { elapsedSeconds: number } }
-  | { type: 'CAPTURE_COMPLETE'; payload: { sampleBlob: Blob; durationSeconds: number } }
+  | { type: 'CAPTURE_PROGRESS'; payload: { elapsedSeconds: number; maxDurationSeconds: number } }
+  | { type: 'CAPTURE_COMPLETE'; payload: { metadata: CapturedSampleMeta } }
   | { type: 'CAPTURE_ERROR'; payload: { error: string } }
 
   // Background / Sidepanel state sync

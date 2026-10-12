@@ -19,6 +19,17 @@ export interface VideoPlaybackState {
   pageUrl: string;
 }
 
+export interface CapturedSampleMeta {
+  videoId: string;
+  startPlaybackSeconds: number;
+  endPlaybackSeconds: number;
+  sampleDurationSeconds: number;
+  blobSizeBytes: number;
+  mimeType: string;
+  capturedAtEpochMs: number;
+  fingerprint?: string;
+}
+
 export interface RecordingMetadata {
   recordingId: string | null; // MusicBrainz recording ID when available
   acoustId: string | null;
