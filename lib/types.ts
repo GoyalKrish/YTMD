@@ -4,8 +4,8 @@ export type DiscoveryStatus =
   | 'capturing'
   | 'fingerprinting'
   | 'identifying'
-  | 'listening'
-  | 'stopped'
+  | 'matched'
+  | 'no-match'
   | 'error';
 
 export interface VideoPlaybackState {
@@ -28,10 +28,45 @@ export interface CapturedSampleMeta {
   mimeType: string;
   capturedAtEpochMs: number;
   fingerprint?: string;
+  fingerprintDurationSeconds?: number;
 }
 
+/** Normalized identification result returned to the side panel */
+export type IdentificationErrorCode =
+  | 'NO_ACTIVE_YOUTUBE_VIDEO'
+  | 'VIDEO_PAUSED'
+  | 'VIDEO_IS_LIVE'
+  | 'CAPTURE_PERMISSION_DENIED'
+  | 'CAPTURE_FAILED'
+  | 'CAPTURE_INTERRUPTED'
+  | 'FINGERPRINT_FAILED'
+  | 'ACOUSTID_REQUEST_FAILED'
+  | 'ACOUSTID_BAD_RESPONSE'
+  | 'NO_MATCH'
+  | 'METADATA_UNAVAILABLE'
+  | 'TIMEOUT';
+
+export interface IdentificationResult {
+  captureId: string;
+  videoId: string;
+  videoTitle: string | null;
+  sampleStartSeconds: number;
+  sampleEndSeconds: number;
+  status: 'matched' | 'no-match' | 'error' | 'cancelled';
+  track?: {
+    title: string;
+    artists: string[];
+    recordingId?: string;
+    acoustId?: string;
+    score?: number;
+  };
+  errorCode?: IdentificationErrorCode;
+  message?: string;
+}
+
+// Legacy types kept for existing timeline/session code (not used in new identify flow)
 export interface RecordingMetadata {
-  recordingId: string | null; // MusicBrainz recording ID when available
+  recordingId: string | null;
   acoustId: string | null;
   title: string;
   artists: string[];

@@ -108,10 +108,10 @@ export default defineContentScript({
       const videoId = getVideoIdFromUrl();
       const video = currentVideoEl;
 
-      const isLive = Boolean(
-        document.querySelector('.ytp-live-badge') &&
-        !document.querySelector('.ytp-live-badge[disabled]')
-      );
+      const playerEl = document.querySelector('.html5-video-player');
+      const isPlayerLive = Boolean(playerEl?.classList.contains('ytp-live'));
+      const isDurationInfinite = Boolean(video && !Number.isNaN(video.duration) && !Number.isFinite(video.duration));
+      const isLive = isPlayerLive || isDurationInfinite;
 
       return {
         videoId,

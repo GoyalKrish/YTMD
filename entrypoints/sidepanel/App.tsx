@@ -2,39 +2,33 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { DiscoveryHeader } from '../../components/DiscoveryHeader';
 import { PlayerContextCard } from '../../components/PlayerContextCard';
 import { DiscoveryControls } from '../../components/DiscoveryControls';
-import { SampleDebugCard } from '../../components/SampleDebugCard';
-import { TrackTimeline } from '../../components/TrackTimeline';
+import { IdentificationResultCard } from '../../components/IdentificationResultCard';
 import { EmptyState } from '../../components/EmptyState';
-import {
-  VideoPlaybackState,
-  DiscoveryStatus,
-  TrackOccurrence,
-  DiscoverySession,
-  CapturedSampleMeta
-} from '../../lib/types';
+import { VideoPlaybackState, DiscoveryStatus, IdentificationResult } from '../../lib/types';
 import { ExtensionMessage } from '../../lib/messages';
-import { getSession, saveSession } from '../../lib/storage';
-import { TabAudioCaptureSession } from '../../lib/audio-capture';
-import { Trash2 } from 'lucide-react';
 
 export default function App() {
   const [playbackState, setPlaybackState] = useState<VideoPlaybackState | null>(null);
   const [activeTabId, setActiveTabId] = useState<number | null>(null);
-  const [occurrences, setOccurrences] = useState<TrackOccurrence[]>([]);
   const [status, setStatus] = useState<DiscoveryStatus>('idle');
   const [statusMessage, setStatusMessage] = useState<string>('');
-  
-  // Milestone 2 audio capture state
   const [elapsedCaptureSec, setElapsedCaptureSec] = useState<number>(0);
-  const [lastCapturedSample, setLastCapturedSample] = useState<CapturedSampleMeta | null>(null);
-  const captureStartPlaybackSec = useRef<number>(0);
-  const isCapturingRef = useRef<boolean>(false);
-  const captureSessionRef = useRef<TabAudioCaptureSession | null>(null);
+  const [lastResult, setLastResult] = useState<IdentificationResult | null>(null);
 
-  // 1. Query the active tab to find YouTube player
+  // Track the in-flight captureId so stale responses are ignored
+  const activeCaptureIdRef = useRef<string | null>(null);
+  const isIdentifyingRef = useRef<boolean>(false);
+
+  // -------------------------------------------------------------------------
+  // Query the active tab to find the YouTube player
+  // -------------------------------------------------------------------------
   const queryActiveTab = useCallback(async () => {
     try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+      if (!tabs || tabs.length === 0) {
+        tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      }
+      const tab = tabs[0];
       if (!tab || !tab.id) return;
       setActiveTabId(tab.id);
 
@@ -44,7 +38,7 @@ export default function App() {
           { type: 'REQUEST_PLAYER_STATE' } as ExtensionMessage,
           (response: VideoPlaybackState) => {
             if (chrome.runtime.lastError) {
-              // Content script not ready yet
+              // Content script not ready yet — silently ignore
             } else if (response) {
               setPlaybackState(response);
             }
@@ -58,120 +52,96 @@ export default function App() {
     }
   }, []);
 
-  // 2. Load stored session whenever videoId changes
-  useEffect(() => {
-    const videoId = playbackState?.videoId;
-    if (!videoId) {
-      setOccurrences([]);
-      setLastCapturedSample(null);
-      return;
-    }
-
-    getSession(videoId).then((session) => {
-      if (session) {
-        setOccurrences(session.occurrences || []);
-      } else {
-        setOccurrences([]);
-      }
-    });
-  }, [playbackState?.videoId]);
-
-  // 3. Save session whenever occurrences change
-  useEffect(() => {
-    const videoId = playbackState?.videoId;
-    if (!videoId) return;
-
-    const session: DiscoverySession = {
-      schemaVersion: 1,
-      videoId,
-      videoTitle: playbackState.title || 'Untitled',
-      videoDuration: playbackState.duration,
-      startedAtEpochMs: Date.now(),
-      updatedAtEpochMs: Date.now(),
-      status,
-      occurrences
-    };
-
-    saveSession(session).catch((err) => console.error('[Sidepanel] Failed to save session:', err));
-  }, [occurrences, playbackState?.videoId, status]);
-
-  // 4. Runtime message listener for capture events and player sync
+  // -------------------------------------------------------------------------
+  // Runtime message handler
+  // -------------------------------------------------------------------------
   useEffect(() => {
     queryActiveTab();
 
     const handleMessage = (message: ExtensionMessage) => {
+      // Shortcut command from background
       if ((message as any).type === 'TRIGGER_CAPTURE_SHORTCUT') {
-        if (!isCapturingRef.current) {
-          handleStartCapture();
-        }
+        if (!isIdentifyingRef.current) handleIdentify();
         return;
       }
 
+      // Player state sync from content script
       if (message.type === 'YOUTUBE_PLAYER_STATE') {
         const newState = message.payload;
         setPlaybackState(newState);
 
-        // Milestone 2 check: if user seeks or pauses while capturing, warn and cancel
-        if (isCapturingRef.current) {
-          const expectedTime = captureStartPlaybackSec.current + elapsedCaptureSec;
+        // Cancel in-flight identification if video paused or seeked far
+        if (isIdentifyingRef.current && activeCaptureIdRef.current) {
           if (newState.isPaused) {
-            handleCancelCapture('Video paused during capture');
-          } else if (Math.abs(newState.currentTime - expectedTime) > 4) {
-            handleCancelCapture('Playback was seeked; sample invalidated');
+            handleCancel('Video paused during capture');
           }
         }
-      } else if (message.type === 'YOUTUBE_NAVIGATED') {
-        if (isCapturingRef.current) {
-          handleCancelCapture('Video changed; capture aborted');
+        return;
+      }
+
+      // YouTube SPA navigation
+      if (message.type === 'YOUTUBE_NAVIGATED') {
+        if (isIdentifyingRef.current && activeCaptureIdRef.current) {
+          handleCancel('Video changed during capture');
         }
         queryActiveTab();
-      } else if (message.type === 'CAPTURE_PROGRESS') {
-        setElapsedCaptureSec(message.payload.elapsedSeconds);
-      } else if (message.type === 'CAPTURE_COMPLETE') {
-        const meta = message.payload.metadata;
-        setLastCapturedSample(meta);
-        setStatus('idle');
-        isCapturingRef.current = false;
+        return;
+      }
+
+      // Capture progress tick (from offscreen via background relay)
+      if (message.type === 'CAPTURE_PROGRESS') {
+        // Only update if this is our active capture
+        if (message.payload.captureId === activeCaptureIdRef.current) {
+          setElapsedCaptureSec(message.payload.elapsedSeconds);
+        }
+        return;
+      }
+
+      // Stage updates from background
+      if (message.type === 'IDENTIFICATION_STATUS') {
+        if (message.payload.captureId !== activeCaptureIdRef.current) return;
+        const { stage } = message.payload;
+        if (stage === 'capturing') {
+          setStatus('capturing');
+          setStatusMessage('Capturing audio (0/' + 15 + 's)...');
+        } else if (stage === 'fingerprinting') {
+          setStatus('fingerprinting');
+          setStatusMessage('Generating fingerprint...');
+          setElapsedCaptureSec(15);
+        } else if (stage === 'identifying') {
+          setStatus('identifying');
+          setStatusMessage('Checking AcoustID...');
+        }
+        return;
+      }
+
+      // Final identification result from background
+      if (message.type === 'IDENTIFICATION_RESULT') {
+        const result = message.payload;
+
+        // Reject stale responses from a previous capture
+        if (result.captureId !== activeCaptureIdRef.current) return;
+
+        activeCaptureIdRef.current = null;
+        isIdentifyingRef.current = false;
         setElapsedCaptureSec(0);
-        setStatusMessage('Captured 15s audio sample successfully!');
+        setLastResult(result);
 
-        // Add occurrence to timeline
-        const startSec = Math.floor(meta.startPlaybackSeconds);
-        const endSec = Math.floor(meta.endPlaybackSeconds);
-        const newTrack: TrackOccurrence = {
-          id: `sample_${Date.now()}`,
-          trackKey: `audio_${startSec}`,
-          metadata: {
-            recordingId: null,
-            acoustId: null,
-            title: `Captured Audio Sample (${startSec}s - ${endSec}s)`,
-            artists: ['Tab Audio Stream'],
-            source: 'acoustid-musicbrainz'
-          },
-          observedWindows: [
-            {
-              sampleStartSeconds: startSec,
-              sampleEndSeconds: endSec,
-              matchedAtEpochMs: meta.capturedAtEpochMs
-            }
-          ],
-          approximateStartSeconds: startSec,
-          approximateEndSeconds: endSec,
-          lastSeenSeconds: endSec,
-          boundaryQuality: 'observed-only'
-        };
-
-        setOccurrences((prev) => {
-          const filtered = prev.filter((o) => Math.abs(o.approximateStartSeconds - startSec) > 3);
-          return [...filtered, newTrack].sort((a, b) => a.approximateStartSeconds - b.approximateStartSeconds);
-        });
-
-        setTimeout(() => setStatusMessage(''), 4000);
-      } else if (message.type === 'CAPTURE_ERROR') {
-        setStatus('error');
-        isCapturingRef.current = false;
-        setElapsedCaptureSec(0);
-        setStatusMessage(`Capture failed: ${message.payload.error}`);
+        if (result.status === 'matched') {
+          setStatus('matched');
+          setStatusMessage('');
+        } else if (result.status === 'no-match') {
+          setStatus('no-match');
+          setStatusMessage(result.message || 'No match found for this sample');
+        } else if (result.status === 'cancelled') {
+          setStatus('idle');
+          setStatusMessage('Capture cancelled');
+          setTimeout(() => setStatusMessage(''), 3000);
+        } else {
+          setStatus('error');
+          setStatusMessage(result.message || 'Identification failed');
+        }
+        return;
       }
     };
 
@@ -190,9 +160,11 @@ export default function App() {
       chrome.tabs.onActivated.removeListener(handleTabActivated);
       chrome.tabs.onUpdated.removeListener(handleTabUpdated);
     };
-  }, [queryActiveTab, elapsedCaptureSec]);
+  }, [queryActiveTab]);
 
-  // 5. Seek video in YouTube player (with self-healing fallback)
+  // -------------------------------------------------------------------------
+  // Seek handler
+  // -------------------------------------------------------------------------
   const handleSeek = async (seconds: number) => {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -201,22 +173,16 @@ export default function App() {
 
       chrome.tabs.sendMessage(
         targetTabId,
-        {
-          type: 'SEEK_TO_TIMESTAMP',
-          payload: { seconds }
-        } as ExtensionMessage,
+        { type: 'SEEK_TO_TIMESTAMP', payload: { seconds } } as ExtensionMessage,
         (response) => {
           if (chrome.runtime.lastError || !response?.success) {
-            // Self-healing fallback: seek the video element directly using scripting API
             chrome.scripting?.executeScript({
               target: { tabId: targetTabId },
               func: (targetSec: number) => {
                 const video =
                   document.querySelector<HTMLVideoElement>('video.html5-main-video') ||
                   document.querySelector<HTMLVideoElement>('video');
-                if (video) {
-                  video.currentTime = targetSec;
-                }
+                if (video) video.currentTime = targetSec;
               },
               args: [seconds]
             }).catch(() => {});
@@ -228,120 +194,92 @@ export default function App() {
     }
   };
 
-  // 6. Milestone 2: User-initiated tab audio capture using TabAudioCaptureSession
-  const handleStartCapture = async () => {
+  // -------------------------------------------------------------------------
+  // Identify song — sends IDENTIFY_SONG to background
+  // -------------------------------------------------------------------------
+  const handleIdentify = async () => {
+    if (isIdentifyingRef.current) return;
     if (!playbackState || !playbackState.videoId) return;
 
-    setStatus('requesting-permission');
-    setStatusMessage('Connecting audio stream...');
-
-    try {
-      // Query the active tab dynamically at click-time
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      const targetTabId = tab?.id || activeTabId;
-
-      if (!targetTabId) {
-        setStatus('error');
-        setStatusMessage('No active YouTube tab found');
-        return;
-      }
-
-      const startPlaybackSec = Math.floor(playbackState.currentTime);
-      captureStartPlaybackSec.current = startPlaybackSec;
-
-      const session = new TabAudioCaptureSession(
-        targetTabId,
-        playbackState.videoId,
-        startPlaybackSec,
-        15,
-        {
-          onProgress: (elapsed, _max) => {
-            setElapsedCaptureSec(elapsed);
-          },
-          onComplete: (meta) => {
-            setLastCapturedSample(meta);
-            setStatus('idle');
-            isCapturingRef.current = false;
-            setElapsedCaptureSec(0);
-            setStatusMessage('Captured 15s audio sample successfully!');
-
-            // Add occurrence to timeline
-            const startSec = Math.floor(meta.startPlaybackSeconds);
-            const endSec = Math.floor(meta.endPlaybackSeconds);
-            const newTrack: TrackOccurrence = {
-              id: `sample_${Date.now()}`,
-              trackKey: `audio_${startSec}`,
-              metadata: {
-                recordingId: null,
-                acoustId: null,
-                title: `Captured Audio Sample (${startSec}s - ${endSec}s)`,
-                artists: ['Tab Audio Stream'],
-                source: 'acoustid-musicbrainz'
-              },
-              observedWindows: [
-                {
-                  sampleStartSeconds: startSec,
-                  sampleEndSeconds: endSec,
-                  matchedAtEpochMs: meta.capturedAtEpochMs
-                }
-              ],
-              approximateStartSeconds: startSec,
-              approximateEndSeconds: endSec,
-              lastSeenSeconds: endSec,
-              boundaryQuality: 'observed-only'
-            };
-
-            setOccurrences((prev) => {
-              const filtered = prev.filter((o) => Math.abs(o.approximateStartSeconds - startSec) > 3);
-              return [...filtered, newTrack].sort((a, b) => a.approximateStartSeconds - b.approximateStartSeconds);
-            });
-
-            setTimeout(() => setStatusMessage(''), 4000);
-          },
-          onError: (err) => {
-            setStatus('error');
-            isCapturingRef.current = false;
-            setElapsedCaptureSec(0);
-            setStatusMessage(`Capture failed: ${err}`);
-          }
-        }
-      );
-
-      captureSessionRef.current = session;
-      setStatus('capturing');
-      isCapturingRef.current = true;
-      setElapsedCaptureSec(0);
-      setStatusMessage('');
-
-      await session.start();
-    } catch (err: any) {
+    // Validate playback
+    if (playbackState.isPaused) {
       setStatus('error');
-      isCapturingRef.current = false;
-      setElapsedCaptureSec(0);
-      setStatusMessage(err?.message || 'Failed to start capture');
+      setStatusMessage('Video is paused. Start playback first.');
+      setTimeout(() => { setStatus('idle'); setStatusMessage(''); }, 4000);
+      return;
     }
+    if (playbackState.isLive) {
+      setStatus('error');
+      setStatusMessage('Live streams are not supported yet.');
+      setTimeout(() => { setStatus('idle'); setStatusMessage(''); }, 4000);
+      return;
+    }
+
+    let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!tabs || tabs.length === 0) {
+      tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    }
+    const tab = tabs[0];
+    const targetTabId = tab?.id || activeTabId;
+    if (!targetTabId) {
+      setStatus('error');
+      setStatusMessage('No active YouTube tab found');
+      return;
+    }
+
+    const captureId = `cap_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    activeCaptureIdRef.current = captureId;
+    isIdentifyingRef.current = true;
+    setLastResult(null);
+    setStatus('requesting-permission');
+    setStatusMessage('Starting capture...');
+    setElapsedCaptureSec(0);
+
+    console.log('[YTMD] Identify requested');
+
+    chrome.runtime.sendMessage({
+      type: 'IDENTIFY_SONG',
+      payload: {
+        captureId,
+        tabId: targetTabId,
+        videoId: playbackState.videoId,
+        videoTitle: playbackState.title,
+        currentTime: Math.floor(playbackState.currentTime)
+      }
+    } as ExtensionMessage, (resp) => {
+      if (chrome.runtime.lastError) {
+        activeCaptureIdRef.current = null;
+        isIdentifyingRef.current = false;
+        setStatus('error');
+        setStatusMessage('Failed to reach background: ' + chrome.runtime.lastError.message);
+      }
+    });
   };
 
-  const handleStopCapture = () => {
-    captureSessionRef.current?.stop();
-    setStatusMessage('Finalizing sample...');
-  };
+  // -------------------------------------------------------------------------
+  // Cancel
+  // -------------------------------------------------------------------------
+  const handleCancel = (reason = 'Capture cancelled') => {
+    const captureId = activeCaptureIdRef.current;
+    if (!captureId) return;
 
-  const handleCancelCapture = (reason = 'Capture cancelled') => {
-    captureSessionRef.current?.cancel(reason);
+    chrome.runtime.sendMessage({
+      type: 'CANCEL_IDENTIFICATION',
+      payload: { captureId }
+    } as ExtensionMessage).catch(() => {});
+
+    activeCaptureIdRef.current = null;
+    isIdentifyingRef.current = false;
     setStatus('idle');
-    isCapturingRef.current = false;
     setElapsedCaptureSec(0);
     setStatusMessage(reason);
     setTimeout(() => setStatusMessage(''), 3500);
   };
 
-  const handleClearTimeline = () => {
-    setOccurrences([]);
-    setLastCapturedSample(null);
-  };
-
   const isConnected = Boolean(playbackState && playbackState.videoId);
+  const isBusy = isIdentifyingRef.current || (
+    status !== 'idle' && status !== 'matched' && status !== 'no-match' && status !== 'error'
+  );
 
   return (
     <div className="app-container">
@@ -358,35 +296,19 @@ export default function App() {
 
           <DiscoveryControls
             status={status}
-            disabled={!isConnected}
-            onStartCapture={handleStartCapture}
-            onStopCapture={handleStopCapture}
-            onCancelCapture={() => handleCancelCapture('Capture cancelled by user')}
+            disabled={!isConnected || isBusy}
+            onIdentify={handleIdentify}
+            onCancel={() => handleCancel('Cancelled by user')}
             elapsedSeconds={elapsedCaptureSec}
             maxSeconds={15}
             statusMessage={statusMessage}
           />
 
-          {lastCapturedSample && (
-            <SampleDebugCard
-              sample={lastCapturedSample}
+          {lastResult && (
+            <IdentificationResultCard
+              result={lastResult}
               onSeek={handleSeek}
             />
-          )}
-
-          {occurrences.length > 0 ? (
-            <>
-              <TrackTimeline occurrences={occurrences} onSeek={handleSeek} />
-              <button
-                className="btn-secondary"
-                style={{ alignSelf: 'center', marginTop: '4px', fontSize: '11px', color: 'var(--text-muted)' }}
-                onClick={handleClearTimeline}
-              >
-                <Trash2 size={12} /> Clear session timeline
-              </button>
-            </>
-          ) : (
-            <EmptyState type="no-tracks" />
           )}
         </>
       )}
